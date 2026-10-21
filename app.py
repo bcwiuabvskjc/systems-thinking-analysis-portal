@@ -93,7 +93,7 @@ if matrix is None:
         st.error("Enter between 2 and 20 unique variable names."); st.stop()
     default_A=pd.DataFrame(np.zeros((len(names_ks),len(names_ks))),index=names_ks,columns=names_ks)
     A=st.data_editor(default_A,use_container_width=True,key="manual_ksim_matrix")
-    else:
+else:
     A = matrix.copy()
     # KSIM convention: rows are targets, columns are sources.
     A.index = A.index.astype(str)

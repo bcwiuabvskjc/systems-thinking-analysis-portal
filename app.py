@@ -98,4 +98,96 @@ else:
     # KSIM convention: rows are targets, columns are sources.
     A.index = A.index.astype(str)
     A.columns = A.columns.astype(str)
+
+
+# Validate and prepare the interaction matrix
+    A = A.apply(pd.to_numeric, errors="coerce")
+    if A.isna().any().any():
+        st.error("The interaction matrix contains missing or non-numeric cells. Fill every cell before running KSIM.")
+        st.stop()
+
+    if A.shape[0] != A.shape[1] or list(A.index) != list(A.columns):
+        st.error("The KSIM interaction matrix must be square, with matching row and column variable names.")
+        st.stop()
+
+    if len(A) < 2 or len(A) > 20:
+        st.error("KSIM requires between 2 and 20 variables.")
+        st.stop()
+
+    st.subheader("KSIM inputs")
+    st.caption("Enter the original-scale initial values and bounds for each variable.")
+
+    defaults = pd.DataFrame({
+        "Variable": list(A.index),
+        "Initial value": [50.0] * len(A),
+        "Minimum": [0.0] * len(A),
+        "Maximum": [100.0] * len(A),
+    })
+
+    settings = st.data_editor(
+        defaults,
+        use_container_width=True,
+        hide_index=True,
+        disabled=["Variable"],
+        key="ksim_variable_settings",
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        steps = st.number_input(
+            "Simulation steps", min_value=1, max_value=200, value=20, step=1
+        )
+    with col2:
+        dt = st.number_input(
+            "Time-step multiplier", min_value=0.1, max_value=5.0,
+            value=1.0, step=0.1
+        )
+
+    if st.button("Run KSIM simulation", type="primary"):
+        try:
+            initial = pd.to_numeric(settings["Initial value"], errors="raise").to_numpy(dtype=float)
+            minimums = pd.to_numeric(settings["Minimum"], errors="raise").to_numpy(dtype=float)
+            maximums = pd.to_numeric(settings["Maximum"], errors="raise").to_numpy(dtype=float)
+
+            if not np.isfinite(initial).all() or not np.isfinite(minimums).all() or not np.isfinite(maximums).all():
+                raise ValueError("Initial values and bounds must be finite numbers.")
+            if (maximums <= minimums).any():
+                raise ValueError("Every maximum must be greater than its minimum.")
+            if ((initial < minimums) | (initial > maximums)).any():
+                raise ValueError("Every initial value must lie between its minimum and maximum.")
+
+            normalized = (initial - minimums) / (maximums - minimums)
+            history, exponents = run_ksim(
+                normalized, A.to_numpy(dtype=float), steps=int(steps), dt=float(dt)
+            )
+            actual_history = denormalize_ksim(history, minimums, maximums)
+
+            results = pd.DataFrame(
+                actual_history,
+                columns=list(A.index)
+            )
+            results.insert(0, "Step", range(len(results)))
+
+            st.success("KSIM simulation completed.")
+            st.subheader("Projected variable behaviour")
+            st.line_chart(results.set_index("Step"))
+            st.subheader("Simulation results")
+            st.dataframe(results, use_container_width=True)
+
+            st.download_button(
+                "Download KSIM results (CSV)",
+                data=results.to_csv(index=False).encode("utf-8"),
+                file_name="ksim_simulation_results.csv",
+                mime="text/csv",
+            )
+            with st.expander("View calculated exponents"):
+                exponent_df = pd.DataFrame(
+                    exponents, columns=list(A.index)
+                )
+                exponent_df.insert(0, "Step", range(1, len(exponent_df) + 1))
+                st.dataframe(exponent_df, use_container_width=True)
+
+        except Exception as exc:
+            st.error(f"KSIM could not run: {exc}")
+
     

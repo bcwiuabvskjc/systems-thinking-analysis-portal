@@ -278,25 +278,27 @@ elif project.get("step") == 3:
     st.latex(r"x_i(t+\Delta t)=x_i(t)^{p_i(t)}")
     st.latex(r"p_i(t)=\frac{1+\frac{\Delta t}{2}\sum_j(|a_{ij}|-a_{ij})x_j}{1+\frac{\Delta t}{2}\sum_j(|a_{ij}|+a_{ij})x_j}")
     st.caption("The formula is implemented as shown in your teaching screenshot and workbook. Time increment Δt defaults to 1, matching the workbook.")
-    c1, c2 = st.columns(2)
-    with c1:
-        project["steps"] = st.number_input(
-    "Number of time steps",
-    min_value=1,
-    max_value=200,
-    value=int(project.get("steps", 10)),
-    step=1,
-    key="steps_input"
-)
-    with c2:
-        project["dt"] = st.number_input(
-    "Time increment (Δt)",
-    min_value=0.1,
-    max_value=10.0,
-    value=float(project.get("dt", 1.0)),
-    step=0.1,
-    key="dt_input"
-)
+    
+        c1, c2 = st.columns(2)
+        with c1:
+            project["steps"] = st.number_input(
+                "Number of time steps",
+                min_value=1,
+                max_value=200,
+                value=int(project.get("steps", 10)),
+                step=1,
+                key="steps_input",
+            )
+        with c2:
+            project["dt"] = st.number_input(
+                "Time increment (Δt)",
+                min_value=0.1,
+                max_value=10.0,
+                value=float(project.get("dt", 1.0)),
+                step=0.1,
+                key="dt_input",
+            )
+
     st.markdown("#### Review before running")
     st.dataframe(pd.DataFrame({"Variable": project["variables"], "Initial state": project["initial"]}), use_container_width=True, hide_index=True)
     st.dataframe(matrix_from_project(project), use_container_width=True)

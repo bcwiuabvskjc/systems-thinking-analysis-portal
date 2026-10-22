@@ -119,6 +119,56 @@ def render_builder(p):
     if step==1:
         st.subheader("Step 1 · Define variables")
         st.write("Each variable represents an attribute. Initial states must be between 0 and 1.")
+        with st.expander("📄 Import variables from CSV (optional)", expanded=False):
+            st.markdown("Upload a CSV with **Variable** and **Initial state** columns. You can also download the template, fill it in Excel, and upload it here.")
+            template_df = pd.DataFrame({"Variable": ["Parthenium", "Asthma incidence"], "Initial state": [0.5, 0.35]})
+            st.download_button("Download variables CSV template", template_df.to_csv(index=False), file_name="ksim_variables_template.csv", mime="text/csv", key=f"variable_template_{p['id']}")
+            variables_file = st.file_uploader("Upload variables CSV", type=["csv"], key=f"variables_upload_{p['id']}")
+            if variables_file is not None:
+                try:
+                    imported_vars = pd.read_csv(variables_file)
+                    # Normalize header spacing/case to make Excel-created files less fragile.
+                    imported_vars.columns = [str(c).strip().lower() for c in imported_vars.columns]
+                    name_col = next((c for c in imported_vars.columns if c in {"variable", "variable name", "name", "variables"}), None)
+                    init_col = next((c for c in imported_vars.columns if c in {"initial state", "initial value", "initial", "initial state (0–1)", "initial state (0-1)"}), None)
+                    if name_col is None or init_col is None:
+                        raise ValueError("CSV must include columns named 'Variable' and 'Initial state'. Download the template for the required format.")
+                    imported_vars = imported_vars[[name_col, init_col]].copy()
+                    imported_vars[name_col] = imported_vars[name_col].astype(str).str.strip()
+                    if imported_vars[name_col].isna().any() or (imported_vars[name_col] == "").any() or (imported_vars[name_col].str.lower() == "nan").any():
+                        raise ValueError("Every row must have a variable name.")
+                    if not 2 <= len(imported_vars) <= 20:
+                        raise ValueError("CSV must contain between 2 and 20 variables.")
+                    if imported_vars[name_col].duplicated().any():
+                        duplicates = imported_vars.loc[imported_vars[name_col].duplicated(keep=False), name_col].unique().tolist()
+                        raise ValueError("Variable names must be unique. Duplicates: " + ", ".join(duplicates))
+                    imported_initial = pd.to_numeric(imported_vars[init_col], errors="raise").astype(float)
+                    if not np.isfinite(imported_initial.to_numpy()).all() or ((imported_initial < 0) | (imported_initial > 1)).any():
+                        raise ValueError("Initial states must be numeric values between 0 and 1.")
+                    st.dataframe(pd.DataFrame({"Variable": imported_vars[name_col], "Initial state": imported_initial}), use_container_width=True, hide_index=True)
+                    if st.button("Import these variables", type="primary", key=f"apply_variables_{p['id']}"):
+                        new_names = imported_vars[name_col].tolist()
+                        old_matrix = matrix_from_project(p)
+                        old_initial = dict(zip(p["variables"], p["initial"]))
+                        new_matrix = pd.DataFrame(0.0, index=new_names, columns=new_names)
+                        for target in new_names:
+                            for source in new_names:
+                                if target in old_matrix.index and source in old_matrix.columns:
+                                    new_matrix.loc[target, source] = float(old_matrix.loc[target, source])
+                        p["variables"] = new_names
+                        p["initial"] = imported_initial.tolist()
+                        p["matrix"] = new_matrix.to_dict(orient="split")
+                        p["results"] = None
+                        p["exponents"] = None
+                        p["step"] = 1
+                        # Clear keyed widget state so the imported values appear immediately.
+                        for widget_key in (f"names_{p['id']}", f"initial_{p['id']}", f"matrix_{p['id']}"):
+                            st.session_state.pop(widget_key, None)
+                        persist_current(False)
+                        st.success("Variables imported. Please review the cross-impact matrix before running the model.")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Could not import variables CSV: {e}")
         names_text=st.text_area("Variable names — one per line", value="\n".join(p["variables"]), height=160, key=f"names_{p['id']}")
         names=[x.strip() for x in names_text.splitlines() if x.strip()]
         valid=len(names)>=2 and len(names)<=20 and len(set(names))==len(names)
@@ -144,6 +194,10 @@ def render_builder(p):
         st.subheader("Step 2 · Build the cross-impact matrix")
         st.info("Rows are affected/target variables (i); columns are influencing/source variables (j).")
         A=matrix_from_project(p)
+        st.markdown("Upload a square CSV matrix whose first column contains target-variable names and whose column headers contain source-variable names. Rows are targets; columns are sources.")
+        matrix_template = A.copy()
+        matrix_template.insert(0, "Target variable", matrix_template.index)
+        st.download_button("Download matrix CSV template", matrix_template.to_csv(index=False), file_name="ksim_matrix_template.csv", mime="text/csv", key=f"matrix_template_{p['id']}")
         upload=st.file_uploader("Optional: import square matrix CSV",type=["csv"],key=f"matrix_upload_{p['id']}")
         if upload is not None:
             try:

@@ -280,9 +280,23 @@ elif project.get("step") == 3:
     st.caption("The formula is implemented as shown in your teaching screenshot and workbook. Time increment Δt defaults to 1, matching the workbook.")
     c1, c2 = st.columns(2)
     with c1:
-        project["steps"] = st.number_input("Number of time steps", min_value=1, max_value=200, value=int(project.get("steps", 10)), step=1)
+        project["steps"] = st.number_input(
+    "Number of time steps",
+    min_value=1,
+    max_value=200,
+    value=int(project.get("steps", 10)),
+    step=1,
+    key="steps_input"
+)
     with c2:
-        project["dt"] = st.number_input("Time increment (Δt)", min_value=0.1, max_value=10.0, value=float(project.get("dt", 1.0)), step=0.1)
+        project["dt"] = st.number_input(
+    "Time increment (Δt)",
+    min_value=0.1,
+    max_value=10.0,
+    value=float(project.get("dt", 1.0)),
+    step=0.1,
+    key="dt_input"
+)
     st.markdown("#### Review before running")
     st.dataframe(pd.DataFrame({"Variable": project["variables"], "Initial state": project["initial"]}), use_container_width=True, hide_index=True)
     st.dataframe(matrix_from_project(project), use_container_width=True)
@@ -300,9 +314,35 @@ elif project.get("step") == 4:
     st.subheader("Step 4 · Run and interpret")
     A = matrix_from_project(project)
     c1, c2, c3 = st.columns(3)
-    c1.metric("Variables", len(project["variables"]))
-    c2.metric("Time steps", project["steps"])
-    c3.metric("Δt", project["dt"])
+with c1:
+    st.markdown(
+        f'<div style="background:#1e293b;padding:18px;border-radius:10px;'
+        f'border:1px solid #475569;color:#ffffff;">'
+        f'<div style="font-size:14px;color:#cbd5e1;">Variables</div>'
+        f'<div style="font-size:30px;font-weight:bold;color:#ffffff;">'
+        f'{len(project["variables"])}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+with c2:
+    st.markdown(
+        f'<div style="background:#1e293b;padding:18px;border-radius:10px;'
+        f'border:1px solid #475569;color:#ffffff;">'
+        f'<div style="font-size:14px;color:#cbd5e1;">Time steps</div>'
+        f'<div style="font-size:30px;font-weight:bold;color:#ffffff;">'
+        f'{project["steps"]}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+with c3:
+    st.markdown(
+        f'<div style="background:#1e293b;padding:18px;border-radius:10px;'
+        f'border:1px solid #475569;color:#ffffff;">'
+        f'<div style="font-size:14px;color:#cbd5e1;">Δt</div>'
+        f'<div style="font-size:30px;font-weight:bold;color:#ffffff;">'
+        f'{project["dt"]}</div></div>',
+        unsafe_allow_html=True,
+    )
     if st.button("▶ Run KSIM", type="primary", use_container_width=True):
         try:
             history, exponents = run_ksim(project["initial"], A.to_numpy(float), int(project["steps"]), float(project["dt"]))

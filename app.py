@@ -278,8 +278,8 @@ elif project.get("step") == 3:
     st.latex(r"x_i(t+\Delta t)=x_i(t)^{p_i(t)}")
     st.latex(r"p_i(t)=\frac{1+\frac{\Delta t}{2}\sum_j(|a_{ij}|-a_{ij})x_j}{1+\frac{\Delta t}{2}\sum_j(|a_{ij}|+a_{ij})x_j}")
     st.caption("The formula is implemented as shown in your teaching screenshot and workbook. Time increment Δt defaults to 1, matching the workbook.")
-    
-        c1, c2 = st.columns(2)
+
+c1, c2 = st.columns(2)
         with c1:
             project["steps"] = st.number_input(
                 "Number of time steps",

@@ -1,59 +1,44 @@
-# Systems Thinking Analysis Portal
+SYSTEMS THINKING PORTAL — AS-IS / TO-BE + ACCOUNTS
 
-A reusable local web application for uploading CSVs, previewing and validating data, running supported cross-impact analysis, inspecting numeric summaries/plots, and downloading a genuine Excel workbook.
+ZIP CONTENTS
+- app.py: Streamlit interface, login/registration, project saving, AS-IS and TO-BE workflow
+- analysis_core.py: KSIM simulation and analysis functions
+- requirements.txt: Python dependencies
+- schema.sql: Supabase database tables and row-level security policies
 
-## Important academic limitation
+IMPORTANT SETUP — LOGIN AND DATABASE
+1. Create a project at https://supabase.com/ and wait until it is ready.
+2. In Supabase, open SQL Editor, paste the complete schema.sql file, and run it.
+3. In Supabase Project Settings / API, copy the Project URL and anon/publishable key. Do NOT use the service_role key in Streamlit.
+4. In your Streamlit Cloud app, open Manage app > Settings > Secrets and add:
 
-The course-specific formulas and workflow for **Kane's Simulation** were not included with the initial request. This version intentionally does not invent or run a substitute. Upload the relevant course notes/example before implementing that module. The influence/dependence measures currently use row sums and column sums, with median-based descriptive groups; confirm these conventions with your course materials.
+SUPABASE_URL = "https://YOUR-PROJECT.supabase.co"
+SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_OR_PUBLISHABLE_KEY"
 
-## Requirements
+5. In your GitHub repository, replace app.py, analysis_core.py and requirements.txt with the versions in this ZIP. You may also add/replace schema.sql and README.txt for reference. Keep a backup of your existing repository before replacing files.
+6. Since you have already created the tables and policies, do NOT rerun schema.sql just for this session fix. Run it only if you are setting up a fresh Supabase project or intentionally updating the database schema.
+7. Commit the files and let Streamlit Cloud redeploy. Then refresh the portal and log in again.
+8. Test personal project save/load and group isolation using two separate accounts before sharing the URL.
 
-- Python 3.10 or newer
-- Internet access during first-time dependency installation (or install packages from a local wheel cache)
-- A modern browser
+AUTH AND DATA NOTES
+- Registration is open to anyone with the portal URL. Supabase may require email verification depending on its Auth settings.
+- Project rows are stored in Supabase Postgres, not a local SQLite file.
+- Row-level security (RLS) is intended to isolate personal projects and group projects.
+- Do not put a Supabase service_role key in Streamlit secrets or client code.
+- Existing projects in an old SQLite database are not automatically migrated into Supabase.
+- Group creation and joining by a shareable join code are included. Group owners should share the code only with intended teammates. Group projects are visible to members; personal projects remain private. Do not disable RLS to make sharing work.
 
-## Install and run
+AS-IS / TO-BE FUNCTIONALITY
+- AS-IS matrix is the baseline cross-impact matrix.
+- TO-BE allows multiple selected interventions.
+- For each selected intervention, specify a target, source and impact value. The Generate button applies these defined rules to the TO-BE matrix; it does not invent relationships.
+- The TO-BE matrix remains manually editable after generation.
+- Both simulations can be run and compared. Original variables are compared on common charts; new intervention variables appear in the TO-BE results.
+- Time labels use T0, T1, T2, etc.
+- Matrix impact values are constrained to [-1, +1] in this interface.
 
-### Windows
-1. Extract the ZIP to a folder.
-2. Install Python 3.10+ and make sure `python` is available in Command Prompt.
-3. Double-click `start_portal.bat` or run these commands in the folder:
+ACADEMIC METHODOLOGY
+The existing core uses the documented simplified KSIM-style exponent variant already present in the source. Confirm the exact formula with the professor's workbook before treating its outputs as identical to the course's official method. The app does not silently create causal links; the student specifies their signs and strengths.
 
-```bat
-python -m venv .venv
-.venv\Scripts\activate
-python -m pip install -r requirements.txt
-python -m streamlit run app.py
-```
-
-4. Streamlit will show a local URL, normally `http://localhost:8501`. Open it in your browser.
-5. Keep the terminal window open while using the app. To stop the server, press `Ctrl+C`. To reopen later, activate `.venv` and run `python -m streamlit run app.py`.
-
-### macOS / Linux
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-python -m streamlit run app.py
-```
-
-## CSV patterns
-
-- General tabular CSV: preview, validation, numeric summaries, and row-order plots.
-- Square cross-impact matrix: first column contains row factor names; remaining column headers contain the same factor names. Values must be numeric.
-- Long-form relationships: use the mapping panel to select source, target, and impact columns. Each directed source-target pair must be unique, numeric, and collectively form a complete square factor set. Missing links are not assumed to be zero.
-
-## Multiple files and data isolation
-
-You can upload multiple CSVs together and choose which one to analyse. Each report is generated for the currently selected file; data from other uploaded files is not merged. Upload additional files in later sessions without changing source code. This initial version does not persist projects/history after the browser session or server restarts; save exported workbooks to retain results.
-
-## Excel export
-
-The button downloads a real `.xlsx` workbook containing Original Data, Cleaned Data, Data Validation, Parameters and Assumptions, plus any applicable Cross-Impact Matrix, Influence Dependence, Numeric Summary, and Executive Summary sheets. It omits worksheets for methods that were not run. Workbook styling includes frozen headers and filters.
-
-## Limits and privacy
-
-- Local availability depends on the computer running the server and its resources. This is not 24/7 cloud hosting.
-- No arbitrary usage counter is implemented. Practical limits depend on RAM, browser performance, and file size.
-- Files are processed by the local app process; this project does not include a cloud database, user accounts, or saved project history.
-- This app does not impute missing values or invent causal links or cross-impact scores.
+LIMITATIONS / TESTING
+This ZIP has not been connected to your live Supabase project or tested in a deployed browser. After setup, test account registration, email confirmation, personal project save/load, group isolation, deletion permissions, and a small AS-IS/TO-BE test before relying on it for coursework. If Streamlit or Supabase reports an error, share the exact error text/screenshot so it can be fixed.

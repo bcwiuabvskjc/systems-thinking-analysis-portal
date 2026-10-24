@@ -1,496 +1,394 @@
 from __future__ import annotations
-import io, json, os
-from pathlib import Path
+import json, os, io
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from analysis_core import (
-    KSIM_FORMULA, authenticate_user, register_user, init_db, save_project,
-    list_projects, load_project, delete_project, run_ksim_course,
-    make_state_frame, make_calculation_frame, validate_model,
-)
 
-st.set_page_config(page_title="Systems Thinking & KSIM Studio", page_icon="🧭", layout="wide")
-st.markdown("""
-<style>
-.block-container {padding-top:1.15rem; padding-bottom:2.5rem; max-width:1600px}
-.hero {padding:1.15rem 1.45rem;border-radius:14px;background:linear-gradient(120deg,#10263c,#245b78);color:white;margin-bottom:1rem}
-.hero h1 {color:white;margin:0;font-size:1.8rem}.hero p {color:#e2edf5;margin:.35rem 0 0}
-[data-testid="stMetric"] {background:rgba(120,140,160,.08);padding:.7rem;border-radius:10px}
-</style>
-<div class="hero"><h1>Systems Thinking & KSIM Studio</h1><p>Entity–attribute modelling · Course-aligned KSIM calculations · Intervention comparison · Private projects</p></div>
-""", unsafe_allow_html=True)
+from analysis_core import run_ksim, denormalize_ksim, cross_impact_metrics
 
-init_db()
+st.set_page_config(page_title="Systems Thinking Portal", page_icon="🧭", layout="wide")
+st.markdown("""<style>.block-container{padding-top:1.3rem;max-width:1500px}.hero{padding:1.25rem 1.5rem;border-radius:14px;background:linear-gradient(120deg,#12263a,#245b78);color:white;margin-bottom:1rem}.hero h1{color:white;margin:0}.hero p{color:#e4edf4;margin:.4rem 0 0}</style><div class="hero"><h1>Systems Thinking Analysis Portal</h1><p>Model the AS-IS system, test multiple TO-BE interventions, and compare outcomes.</p></div>""", unsafe_allow_html=True)
 
-# ----------- Demo model, taken from the user's supplied professor workbook screenshots -----------
-def professor_example():
-    variables = pd.DataFrame([
-        {"Code":"x1", "Entity":"Parthenium", "Relevant attribute":"Abundance of Parthenium", "Initial value":0.500, "Start time":0},
-        {"Code":"x2", "Entity":"City People", "Relevant attribute":"Incidence of Asthma in City People", "Initial value":0.350, "Start time":0},
-        {"Code":"x3", "Entity":"City People", "Relevant attribute":"Happiness Level", "Initial value":0.350, "Start time":0},
-        {"Code":"x4", "Entity":"Government", "Relevant attribute":"Seriousness for Parthenium Eradication", "Initial value":0.300, "Start time":0},
-        {"Code":"x5", "Entity":"Hospitals", "Relevant attribute":"No. of Admitted Asthma Patients", "Initial value":0.300, "Start time":0},
-        {"Code":"x6", "Entity":"Expert Committee", "Relevant attribute":"Involvement of Expert Committee", "Initial value":0.100, "Start time":0},
-        {"Code":"x7", "Entity":"Beetle", "Relevant attribute":"No. of Beetle", "Initial value":0.300, "Start time":4},
-    ])
-    codes = variables["Code"].tolist()
-    A = np.array([
-        [ 0.30,  0.00,  0.00, -0.10,  0.00,  0.00, -0.90],
-        [ 0.70, -0.20, -0.20, -0.30,  0.00, -0.10,  0.00],
-        [-0.70, -0.80,  0.40,  0.10, -0.70,  0.00,  0.10],
-        [ 0.60,  0.70, -0.50, -0.20,  0.50,  0.60, -0.30],
-        [ 0.70,  0.30, -0.10, -0.10, -0.20, -0.10,  0.00],
-        [ 0.50,  0.50, -0.50,  0.70,  0.60,  0.50, -0.30],
-        [ 0.00,  0.00,  0.00,  0.00,  0.00,  0.00,  0.50],
-    ], dtype=float)
-    matrix = pd.DataFrame(A, index=codes, columns=codes)
-    return variables, matrix
+# ---------------- Auth and cloud persistence ----------------
+def get_supabase():
+    try:
+        from supabase import create_client
+        url = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", ""))
+        key = st.secrets.get("SUPABASE_ANON_KEY", os.getenv("SUPABASE_ANON_KEY", ""))
+        if not url or not key:
+            return None, "Supabase credentials are not configured."
+        return create_client(url, key), None
+    except Exception as exc:
+        return None, f"Supabase setup error: {exc}"
 
+sb, sb_error = get_supabase()
+if "auth_session" not in st.session_state: st.session_state.auth_session = None
+if "user" not in st.session_state: st.session_state.user = None
+if "active_workspace" not in st.session_state: st.session_state.active_workspace = "personal"
 
-def df_json(df: pd.DataFrame) -> list:
-    return json.loads(df.to_json(orient="records", double_precision=15))
-
-
-def current_payload():
-    return {
-        "schema_version": 2,
-        "variables": df_json(st.session_state.model_variables),
-        "matrix_codes": list(st.session_state.model_matrix.index.astype(str)),
-        "matrix": st.session_state.model_matrix.to_numpy(float).tolist(),
-        "simulation_steps": int(st.session_state.get("steps", 11)),
-        "dt": float(st.session_state.get("dt", 1.0)),
-    }
-
-
-def apply_payload(payload: dict):
-    vars_df = pd.DataFrame(payload["variables"])
-    expected = ["Code", "Entity", "Relevant attribute", "Initial value", "Start time"]
-    for col in expected:
-        if col not in vars_df:
-            vars_df[col] = 0 if col in ("Initial value", "Start time") else ""
-    vars_df = vars_df[expected]
-    codes = vars_df["Code"].astype(str).tolist()
-    mat = np.asarray(payload.get("matrix", np.zeros((len(codes), len(codes)))), dtype=float)
-    matrix = pd.DataFrame(mat, index=codes, columns=codes)
-    st.session_state.model_variables = vars_df
-    st.session_state.model_matrix = matrix
-    st.session_state.matrix_revision = st.session_state.get("matrix_revision", 0) + 1
-    st.session_state.steps = int(payload.get("simulation_steps", 11))
-    st.session_state.dt = float(payload.get("dt", 1.0))
-    st.session_state.pop("latest_run", None)
-    st.session_state.pop("latest_comparison", None)
-
-
-def clear_run():
-    st.session_state.pop("latest_run", None)
-    st.session_state.pop("latest_comparison", None)
-
-
-def login_screen():
-    st.subheader("Sign in to your private workspace")
-    st.write("Projects are scoped to the signed-in account. Other users cannot open or delete your saved projects through the portal's project controls.")
-    login_tab, register_tab = st.tabs(["Sign in", "Create account"])
-    with login_tab:
-        with st.form("login_form"):
-            username = st.text_input("Username", key="login_username")
-            password = st.text_input("Password", type="password", key="login_password")
-            submit = st.form_submit_button("Sign in", type="primary", use_container_width=True)
-        if submit:
-            user = authenticate_user(username, password)
-            if user:
-                st.session_state.auth_user = user
-                st.rerun()
-            else:
-                st.error("Incorrect username or password.")
-    with register_tab:
-        st.info("Create a unique username and a password of at least 10 characters. This starter version does not verify email addresses.")
-        with st.form("register_form"):
-            new_user = st.text_input("Choose username", key="register_username")
-            new_pass = st.text_input("Choose password", type="password", key="register_password")
-            confirm = st.text_input("Confirm password", type="password", key="register_confirm")
-            submit_reg = st.form_submit_button("Create account", type="primary", use_container_width=True)
-        if submit_reg:
-            if new_pass != confirm:
-                st.error("The passwords do not match.")
-            else:
-                try:
-                    register_user(new_user, new_pass)
-                    st.success("Account created. Sign in using the Sign in tab.")
-                except Exception as exc:
-                    st.error(str(exc))
-    st.divider()
-    st.caption("Hosting note: this ZIP uses a local SQLite database. For durable multi-user hosting, configure a persistent disk or managed database; see the included README before relying on it for important projects.")
-
-if "auth_user" not in st.session_state:
-    st.session_state.auth_user = None
-if not st.session_state.auth_user:
-    login_screen()
+if sb is None:
+    st.error("Login/database setup is required before the portal can be used.")
+    st.write(sb_error)
+    st.markdown("Open `README.txt` in the ZIP and complete the Supabase setup, then add `SUPABASE_URL` and `SUPABASE_ANON_KEY` to Streamlit Secrets.")
     st.stop()
 
-user = st.session_state.auth_user
-if "model_variables" not in st.session_state:
-    v, m = professor_example()
-    st.session_state.model_variables = v
-    st.session_state.model_matrix = m
-    st.session_state.matrix_revision = 0
-    st.session_state.steps = 11
-    st.session_state.dt = 1.0
-    st.session_state.project_name = "Parthenium — professor example"
+# Streamlit reruns create a new Supabase client, so restore the authenticated session.
+if st.session_state.auth_session and not st.session_state.user:
+    try:
+        sess = st.session_state.auth_session
+        sb.auth.set_session(sess.access_token, sess.refresh_token)
+        st.session_state.user = sb.auth.get_user().user
+    except Exception:
+        st.session_state.user = None
+        st.session_state.auth_session = None
 
-# ----------- Sidebar: private project controls -----------
-with st.sidebar:
-    st.markdown(f"### Signed in as `{user['username']}`")
-    if st.button("Sign out", use_container_width=True):
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        st.rerun()
-    st.divider()
-    st.subheader("My private projects")
-    projects = list_projects(user["id"])
-    if projects:
-        labels = {f"{p['name']} · {p['updated_at']}": p for p in projects}
-        chosen_label = st.selectbox("Saved project", list(labels), key="saved_project_select")
-        chosen = labels[chosen_label]
-        c_load, c_delete = st.columns(2)
-        if c_load.button("Open", use_container_width=True):
+if not st.session_state.user:
+    st.subheader("Sign in or create a student account")
+    st.caption("Open registration is enabled. Use an email address you can access to verify your account if email confirmation is enabled in Supabase.")
+    tab_login, tab_register = st.tabs(["Log in", "Create account"])
+    with tab_login:
+        with st.form("login_form"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_password")
+            submit_login = st.form_submit_button("Log in", type="primary", use_container_width=True)
+        if submit_login:
             try:
-                name, payload, _ = load_project(user["id"], chosen["id"])
-                apply_payload(payload)
-                st.session_state.project_name = name
-                st.success(f"Opened {name}")
+                response = sb.auth.sign_in_with_password({"email": email.strip(), "password": password})
+                st.session_state.user = response.user
+                st.session_state.auth_session = response.session
                 st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
-        if c_delete.button("Delete", use_container_width=True):
-            st.session_state.confirm_delete_project_id = chosen["id"]
-        if st.session_state.get("confirm_delete_project_id") == chosen["id"]:
-            st.warning(f"Delete **{chosen['name']}** permanently from your account?")
-            d1, d2 = st.columns(2)
-            if d1.button("Confirm delete", type="primary"):
+            except Exception as exc: st.error(f"Login failed: {exc}")
+    with tab_register:
+        with st.form("register_form"):
+            name = st.text_input("Full name")
+            reg_email = st.text_input("Email address")
+            reg_password = st.text_input("Create password", type="password")
+            confirm_password = st.text_input("Confirm password", type="password")
+            submit_register = st.form_submit_button("Create account", type="primary", use_container_width=True)
+        if submit_register:
+            if not name.strip() or not reg_email.strip(): st.error("Enter your name and email.")
+            elif len(reg_password) < 8: st.error("Use a password with at least 8 characters.")
+            elif reg_password != confirm_password: st.error("Passwords do not match.")
+            else:
                 try:
-                    delete_project(user["id"], chosen["id"])
-                    st.session_state.pop("confirm_delete_project_id", None)
-                    st.success("Project deleted from your account.")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(str(exc))
-            if d2.button("Cancel"):
-                st.session_state.pop("confirm_delete_project_id", None)
-                st.rerun()
-    else:
-        st.caption("You have no saved projects yet.")
+                    response = sb.auth.sign_up({"email": reg_email.strip(), "password": reg_password, "options": {"data": {"full_name": name.strip()}}})
+                    if getattr(response, "session", None):
+                        st.session_state.user = response.user
+                        st.session_state.auth_session = response.session
+                        st.success("Account created.")
+                        st.rerun()
+                    else:
+                        st.success("Account created. Check your email if confirmation is required, then log in.")
+                except Exception as exc: st.error(f"Registration failed: {exc}")
+    st.stop()
+
+user = st.session_state.user
+uid = str(user.id)
+with st.sidebar:
+    st.markdown("### Account")
+    st.write(getattr(user, "email", "Signed in"))
+    if st.button("Log out", use_container_width=True):
+        try: sb.auth.sign_out()
+        except Exception: pass
+        st.session_state.user = None; st.session_state.auth_session = None
+        st.rerun()
     st.divider()
-    st.caption("Saving is account-specific. Sharing the public app URL does not share your project records.")
+    st.markdown("### Workspaces")
+    workspace_mode = st.radio("Workspace", ["My projects", "Group workspace"], key="workspace_mode")
 
-# ----------- Project import / save / demo -----------
-st.subheader("Project")
-pcol1, pcol2, pcol3, pcol4 = st.columns([2, 1, 1, 1])
-with pcol1:
-    st.session_state.project_name = st.text_input("Project name", value=st.session_state.get("project_name", "My KSIM project"), key="project_name_input")
-with pcol2:
-    if st.button("Save to my account", type="primary", use_container_width=True):
-        try:
-            save_project(user["id"], st.session_state.project_name, current_payload())
-            st.success("Saved privately to your account.")
-        except Exception as exc:
-            st.error(str(exc))
-with pcol3:
-    backup = json.dumps(current_payload(), indent=2, ensure_ascii=False).encode("utf-8")
-    st.download_button("Download JSON", backup, file_name="ksim_project_backup.json", mime="application/json", use_container_width=True)
-with pcol4:
-    if st.button("Reset to professor example", use_container_width=True):
-        v, m = professor_example()
-        st.session_state.model_variables = v
-        st.session_state.model_matrix = m
-        st.session_state.matrix_revision += 1
-        st.session_state.project_name = "Parthenium — professor example"
-        st.session_state["project_name_input"] = "Parthenium — professor example"
-        clear_run()
-        st.rerun()
-
-with st.expander("Import a JSON project backup"):
-    json_upload = st.file_uploader("Choose a previously exported KSIM JSON file", type=["json"], key="json_restore")
-    if json_upload is not None and st.button("Restore JSON backup", key="restore_json_button"):
-        try:
-            payload = json.load(json_upload)
-            apply_payload(payload)
-            st.session_state.project_name = "Restored project"
-            st.session_state["project_name_input"] = "Restored project"
-            st.success("Project restored. Save it to your account to keep it in your private project list.")
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Could not restore this JSON file: {exc}")
-
-st.divider()
-
-# ----------- Model definition -----------
-st.header("1 · Entities and relevant attributes")
-st.write("An **entity** is the actor or object in the system. A **relevant attribute** is the state/characteristic being simulated. Each attribute gets its own code (x1, x2, …) and one row in the matrix.")
-add_col, import_col, template_col = st.columns([1, 2, 2])
-with add_col:
-    if st.button("＋ Add variable", type="primary", use_container_width=True):
-        old_v = st.session_state.model_variables.copy()
-        old_m = st.session_state.model_matrix.copy()
-        new_idx = len(old_v) + 1
-        new_code = f"x{new_idx}"
-        while new_code in old_v["Code"].astype(str).tolist():
-            new_idx += 1; new_code = f"x{new_idx}"
-        new_row = {"Code":new_code,"Entity":"New entity","Relevant attribute":"New relevant attribute","Initial value":0.5,"Start time":0}
-        st.session_state.model_variables = pd.concat([old_v, pd.DataFrame([new_row])], ignore_index=True)
-        new_codes = st.session_state.model_variables["Code"].astype(str).tolist()
-        expanded = pd.DataFrame(0.0, index=new_codes, columns=new_codes)
-        for r in old_m.index:
-            for c in old_m.columns:
-                expanded.loc[str(r), str(c)] = float(old_m.loc[r, c])
-        st.session_state.model_matrix = expanded
-        st.session_state.matrix_revision += 1
-        clear_run()
-        st.rerun()
-with import_col:
-    var_upload = st.file_uploader("Import variables CSV", type=["csv"], key="variables_csv_upload", help="Required columns: Code, Entity, Relevant attribute, Initial value. Optional: Start time.")
-    if var_upload is not None and st.button("Import variables", key="import_variables_button"):
-        try:
-            imported = pd.read_csv(var_upload)
-            rename_map = {c.lower().strip(): c for c in imported.columns}
-            def find_col(*names):
-                for name in names:
-                    if name in rename_map: return rename_map[name]
-                return None
-            c_code=find_col("code","variable code"); c_ent=find_col("entity"); c_attr=find_col("relevant attribute","attribute","variable","name")
-            c_init=find_col("initial value","initial","t=0","t0"); c_start=find_col("start time","start","introduced at")
-            if not all([c_code,c_ent,c_attr,c_init]): raise ValueError("CSV must include Code, Entity, Relevant attribute, and Initial value columns.")
-            newv=pd.DataFrame({"Code":imported[c_code].astype(str),"Entity":imported[c_ent].astype(str),"Relevant attribute":imported[c_attr].astype(str),"Initial value":pd.to_numeric(imported[c_init],errors="raise"),"Start time":pd.to_numeric(imported[c_start],errors="raise").fillna(0).astype(int) if c_start else 0})
-            codes=newv["Code"].tolist()
-            st.session_state.model_variables=newv
-            st.session_state.model_matrix=pd.DataFrame(0.0,index=codes,columns=codes)
-            st.session_state.matrix_revision += 1
-            clear_run(); st.success("Variables imported. Please import or fill the cross-impact matrix next."); st.rerun()
-        except Exception as exc: st.error(f"Could not import variables: {exc}")
-with template_col:
-    template = pd.DataFrame([{ "Code":"x1","Entity":"Entity name","Relevant attribute":"Attribute being simulated","Initial value":0.5,"Start time":0},{"Code":"x2","Entity":"Another entity","Relevant attribute":"Another attribute","Initial value":0.35,"Start time":0}])
-    st.download_button("Download variables CSV template", template.to_csv(index=False).encode(), "variables_template.csv", "text/csv", use_container_width=True)
-
-# Stable editor key changes when variables are added/imported, avoiding stale grid shapes.
-var_key = f"variables_editor_{len(st.session_state.model_variables)}_{st.session_state.matrix_revision}"
-editable_vars = st.data_editor(
-    st.session_state.model_variables,
-    key=var_key,
-    num_rows="dynamic",
-    hide_index=True,
-    use_container_width=True,
-    column_config={
-        "Code": st.column_config.TextColumn("Variable code", help="Unique ID used by the cross-impact matrix"),
-        "Entity": st.column_config.TextColumn("Entity"),
-        "Relevant attribute": st.column_config.TextColumn("Relevant attribute / variable"),
-        "Initial value": st.column_config.NumberColumn("Initial state (0–1)", min_value=0.0, max_value=1.0, step=0.01, format="%.5f"),
-        "Start time": st.column_config.NumberColumn("Introduced at T", min_value=0, max_value=200, step=1),
-    },
-)
-if not editable_vars.equals(st.session_state.model_variables):
-    old_codes = st.session_state.model_variables["Code"].astype(str).tolist()
-    edited = editable_vars.copy()
-    edited["Code"] = edited["Code"].astype(str).str.strip()
-    new_codes = edited["Code"].tolist()
-    old_matrix = st.session_state.model_matrix.copy()
-    # preserve matrix values for codes retained; new codes get zeros.
-    expanded = pd.DataFrame(0.0, index=new_codes, columns=new_codes)
-    for r in new_codes:
-        for c in new_codes:
-            if r in old_matrix.index and c in old_matrix.columns:
-                expanded.loc[r,c] = old_matrix.loc[r,c]
-    st.session_state.model_variables = edited.reset_index(drop=True)
-    st.session_state.model_matrix = expanded
-    st.session_state.matrix_revision += 1
-    clear_run()
-    st.rerun()
-
-st.caption("State values and matrix impacts use the 0–1 state scale and the impact coefficients you provide. Variables with Start time = T4 remain absent before T4, then enter at their initial value.")
-
-st.header("2 · Cross-impact matrix")
-st.write("Rows are target attributes (i); columns are influencing/source attributes (j), matching the supplied KSIM equation. A positive coefficient contributes to the denominator; a negative coefficient contributes to the numerator.")
-mat_codes = st.session_state.model_variables["Code"].astype(str).tolist()
-curmat = st.session_state.model_matrix.copy().reindex(index=mat_codes, columns=mat_codes, fill_value=0.0)
-mc1, mc2 = st.columns([2, 2])
-with mc1:
-    mat_upload = st.file_uploader("Optional: import square matrix CSV", type=["csv"], key="matrix_csv_upload")
-    if mat_upload is not None and st.button("Import matrix CSV", key="import_matrix_button"):
-        try:
-            raw = pd.read_csv(mat_upload, index_col=0)
-            raw.index = raw.index.astype(str); raw.columns = raw.columns.astype(str)
-            raw = raw.apply(pd.to_numeric, errors="raise")
-            if raw.shape != (len(mat_codes),len(mat_codes)) or list(raw.index) != mat_codes or list(raw.columns) != mat_codes:
-                raise ValueError("Matrix CSV must be square and use the same variable codes in the same order as the variable table.")
-            st.session_state.model_matrix=raw
-            st.session_state.matrix_revision += 1
-            clear_run(); st.success("Matrix imported."); st.rerun()
-        except Exception as exc: st.error(f"Could not import matrix: {exc}")
-with mc2:
-    mat_template = curmat.copy(); mat_template.insert(0,"Variable code",mat_template.index)
-    st.download_button("Download matrix CSV template",mat_template.to_csv(index=False).encode(),"cross_impact_matrix_template.csv","text/csv",use_container_width=True)
-mat_key = f"matrix_editor_{len(mat_codes)}_{st.session_state.matrix_revision}"
-editable_matrix = st.data_editor(curmat, key=mat_key, use_container_width=True, num_rows="fixed", column_config={c:st.column_config.NumberColumn(c,format="%.4f") for c in mat_codes})
-if not editable_matrix.equals(curmat):
-    st.session_state.model_matrix = editable_matrix.apply(pd.to_numeric,errors="coerce").reindex(index=mat_codes,columns=mat_codes)
-    st.session_state.matrix_revision += 1
-    clear_run()
-    st.rerun()
-
-# ----------- Simulation settings and interventions -----------
-st.header("3 · KSIM simulation")
-st.latex(r"x_i(t+\Delta t)=x_i(t)^{p_i(t)}")
-st.latex(r"p_i(t)=\frac{1+\frac{\Delta t}{2}\sum_{j=1}^{N}(|a_{ij}|-a_{ij})x_j(t)}{1+\frac{\Delta t}{2}\sum_{j=1}^{N}(|a_{ij}|+a_{ij})x_j(t)}")
-st.caption("This is the formula shown in the supplied course reference. Δt defaults to 1. Exponents are calculated for each active attribute at T0, T1, …; the resulting state is shown at the next time point.")
-sc1, sc2, sc3 = st.columns(3)
-with sc1:
-    steps = st.number_input("Final time period", min_value=1, max_value=200, value=int(st.session_state.get("steps",11)), step=1, key="steps")
-with sc2:
-    dt = st.number_input("Δt", min_value=0.01, max_value=5.0, value=float(st.session_state.get("dt",1.0)), step=0.1, key="dt")
-with sc3:
-    st.metric("Number of attributes", len(st.session_state.model_variables))
-
-st.subheader("Optional intervention scenario")
-st.write("Add an intervention to set an attribute to a new 0–1 value at a selected time. The portal runs the original baseline and the intervention scenario separately, then compares them.")
-intervention_seed = pd.DataFrame(columns=["Variable code", "Time", "Set value"])
-interventions = st.data_editor(
-    intervention_seed, num_rows="dynamic", hide_index=True,
-    use_container_width=True,
-    column_config={
-        "Variable code": st.column_config.SelectboxColumn("Attribute to intervene on", options=mat_codes, required=True),
-        "Time": st.column_config.NumberColumn("At time T", min_value=0, max_value=int(steps), step=1, required=True),
-        "Set value": st.column_config.NumberColumn("Set state (0–1)", min_value=0.0, max_value=1.0, step=0.01, required=True, format="%.5f"),
-    },
-    key="intervention_editor",
-)
-run1, run2 = st.columns([1, 3])
-with run1:
-    run_clicked = st.button("Run simulation", type="primary", use_container_width=True)
-with run2:
-    st.caption("The graph plots state values over time, not exponents. Exponents and their numerator/denominator are shown in the calculation table below.")
-
-if run_clicked:
+# Group management relies on RLS policies in schema.sql. Users only see groups they belong to.
+def fetch_groups():
     try:
-        current_vars = st.session_state.model_variables.copy().reset_index(drop=True)
-        current_mat = st.session_state.model_matrix.copy().reindex(index=current_vars["Code"].astype(str), columns=current_vars["Code"].astype(str))
-        current_vars["Initial value"] = pd.to_numeric(current_vars["Initial value"], errors="raise")
-        current_vars["Start time"] = pd.to_numeric(current_vars["Start time"], errors="raise").astype(int)
-        validate_model(current_vars, current_mat)
-        if (current_vars["Start time"] > int(steps)).any():
-            raise ValueError("A variable's Start time cannot be later than the selected final time period.")
-        state, exp, nums, dens = run_ksim_course(current_vars, current_mat, int(steps), float(dt))
-        st.session_state.latest_run = {"variables":current_vars,"matrix":current_mat,"states":state,"exponents":exp,"numerators":nums,"denominators":dens,"steps":int(steps),"dt":float(dt)}
-        # Intervention comparison is optional. Empty rows are ignored.
-        valid_interventions = interventions.dropna(subset=["Variable code","Time","Set value"]).copy() if len(interventions) else pd.DataFrame()
-        if not valid_interventions.empty:
-            valid_interventions["Time"] = valid_interventions["Time"].astype(int)
-            state_i, exp_i, nums_i, dens_i = run_ksim_course(current_vars, current_mat, int(steps), float(dt), valid_interventions)
-            st.session_state.latest_comparison = {"states":state_i,"exponents":exp_i,"numerators":nums_i,"denominators":dens_i,"interventions":valid_interventions}
+        memberships = sb.table("group_members").select("group_id, role, groups(id,name,created_by)").eq("user_id", uid).execute().data or []
+        out=[]
+        for row in memberships:
+            g=row.get("groups")
+            if isinstance(g, dict): out.append({"id":g.get("id"),"name":g.get("name"),"role":row.get("role","member")})
+        return out
+    except Exception as exc:
+        st.warning(f"Could not load groups: {exc}")
+        return []
+
+groups = fetch_groups()
+workspace_id = None
+workspace_label = "Personal workspace"
+if workspace_mode == "Group workspace":
+    with st.sidebar:
+        if groups:
+            options = {f"{g['name']} ({g['role']})":g for g in groups}
+            selected_group_label = st.selectbox("Choose group", list(options))
+            selected_group = options[selected_group_label]
+            workspace_id = selected_group["id"]
+            workspace_label = selected_group["name"]
         else:
-            st.session_state.pop("latest_comparison", None)
-        st.success("Simulation completed using the course formula.")
-    except Exception as exc:
-        st.error(f"Simulation could not run: {exc}")
+            st.caption("You are not a member of a group yet. Create one below or ask a group owner to add you.")
+        with st.expander("Create a group"):
+            group_name = st.text_input("Group name", key="new_group_name")
+            if st.button("Create group", key="create_group"):
+                if not group_name.strip(): st.error("Enter a group name.")
+                else:
+                    try:
+                        created=sb.table("groups").insert({"name":group_name.strip(),"created_by":uid}).execute().data
+                        gid=created[0]["id"]
+                        sb.table("group_members").insert({"group_id":gid,"user_id":uid,"role":"owner"}).execute()
+                        st.success(f"Group created. Share this join code with your teammates: {created[0].get('join_code', 'See Supabase groups table')}")
+                        st.rerun()
+                    except Exception as exc: st.error(f"Could not create group: {exc}")
+        with st.expander("Join an existing group"):
+            join_code = st.text_input("Group join code", key="join_group_code")
+            if st.button("Join group", key="join_group_button"):
+                if not join_code.strip(): st.error("Enter the join code shared by your group owner.")
+                else:
+                    try:
+                        sb.rpc("join_group_by_code", {"code": join_code.strip()}).execute()
+                        st.success("Joined group successfully.")
+                        st.rerun()
+                    except Exception as exc: st.error(f"Could not join group: {exc}")
 
-result = st.session_state.get("latest_run")
-if result:
-    vars_run = result["variables"]
-    state = result["states"]
-    exp = result["exponents"]
-    nums = result["numerators"]
-    dens = result["denominators"]
-    steps_run = result["steps"]
-    state_frame = make_state_frame(vars_run, state)
-    st.header("4 · Results — state values by time")
-    st.caption("The table follows the workbook layout: entity, relevant attribute, code, then T0, T1, T2, …")
-    state_format = {c: st.column_config.NumberColumn(c, format="%.3f") for c in state_frame.columns if c.startswith("T")}
-    st.dataframe(state_frame, use_container_width=True, hide_index=True, height=360, column_config=state_format)
-    st.download_button("Download state results CSV", state_frame.to_csv(index=False).encode("utf-8"), "KSIM_State_Results.csv", "text/csv")
-
-    options = {f"{r['Code']} — {r['Relevant attribute']} ({r['Entity']})": r["Code"] for _,r in vars_run.iterrows()}
-    selected_labels = st.multiselect("Choose attributes to plot together", options=list(options), default=list(options)[:min(4,len(options))], key="plot_selection")
-    selected_codes = [options[x] for x in selected_labels]
-    time_labels = [f"T{t}" for t in range(steps_run+1)]
-    plot_rows=[]
-    for i, row in vars_run.iterrows():
-        if row["Code"] not in selected_codes: continue
-        for t, time_label in enumerate(time_labels):
-            plot_rows.append({"Time":time_label,"Time index":t,"Attribute":f"{row['Code']} — {row['Relevant attribute']}","State value":state[t,i]})
-    plot_df = pd.DataFrame(plot_rows)
-    st.subheader("Behaviour-over-time graph")
-    if not plot_df.empty:
-        fig = px.line(plot_df, x="Time", y="State value", color="Attribute", markers=True, category_orders={"Time":time_labels}, title="KSIM state trajectories (0–1 scale)")
-        fig.update_yaxes(range=[0,1], title="State value (0–1)")
-        fig.update_xaxes(title="Time period")
-        fig.update_layout(legend_title_text="Relevant attribute", hovermode="x unified")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Select at least one attribute to display the graph.")
-
-    comparison = st.session_state.get("latest_comparison")
-    if comparison:
-        st.subheader("Baseline vs intervention comparison")
-        comp_rows=[]
-        for i,row in vars_run.iterrows():
-            if row["Code"] not in selected_codes: continue
-            for t, time_label in enumerate(time_labels):
-                comp_rows.append({"Time":time_label,"Attribute":f"{row['Code']} — {row['Relevant attribute']}","Scenario":"Baseline","State value":state[t,i]})
-                comp_rows.append({"Time":time_label,"Attribute":f"{row['Code']} — {row['Relevant attribute']}","Scenario":"Intervention","State value":comparison["states"][t,i]})
-        comp_df=pd.DataFrame(comp_rows)
-        figc=px.line(comp_df,x="Time",y="State value",color="Attribute",line_dash="Scenario",markers=True,category_orders={"Time":time_labels},title="Baseline vs intervention")
-        figc.update_yaxes(range=[0,1],title="State value (0–1 scale)")
-        figc.update_layout(hovermode="x unified")
-        st.plotly_chart(figc,use_container_width=True)
-        st.caption("An intervention changes the selected state at the chosen time; subsequent periods are recalculated using the same KSIM formula.")
-        comp_state = make_state_frame(vars_run, comparison["states"])
-        st.dataframe(comp_state, use_container_width=True, hide_index=True)
-
-    st.header("5 · Inspect calculated KSIM exponents")
-    calc_frame = make_calculation_frame(vars_run, nums, dens, exp)
-    st.caption("For every active variable and time point, the table shows the numerator, denominator, and exponent Pᵢ(t), in the same order as the professor's calculation sheet. Inactive variables remain blank until their Start time.")
-    calc_format = {c: st.column_config.NumberColumn(c, format="%.5f") for c in calc_frame.columns if "Pᵢ" in c}
-    st.dataframe(calc_frame, use_container_width=True, hide_index=True, height=420, column_config=calc_format)
-    st.download_button("Download detailed KSIM calculations CSV", calc_frame.to_csv(index=False).encode("utf-8"), "KSIM_Detailed_Calculations.csv", "text/csv")
-    with st.expander("Cross-impact matrix used for this run"):
-        st.dataframe(result["matrix"], use_container_width=True)
-
-    # Excel export with workbook-like tables
+# project save/load; database RLS prevents cross-user / cross-group access.
+def load_projects():
     try:
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        from openpyxl.utils import get_column_letter
-        output=io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            state_frame.to_excel(writer,sheet_name="State Results",index=False)
-            result["matrix"].rename_axis("Target code").to_excel(writer,sheet_name="Cross Impact Matrix")
-            calc_frame.to_excel(writer,sheet_name="KSIM Calculations",index=False)
-            vars_run.to_excel(writer,sheet_name="Variables",index=False)
-            if comparison:
-                make_state_frame(vars_run,comparison["states"]).to_excel(writer,sheet_name="Intervention Results",index=False)
-        output.seek(0)
-        wb=__import__("openpyxl").load_workbook(output)
-        for ws in wb.worksheets:
-            ws.freeze_panes="A2"; ws.sheet_view.showGridLines=False
-            if ws.max_row>1: ws.auto_filter.ref=ws.dimensions
-            for cell in ws[1]:
-                cell.font=Font(bold=True,color="FFFFFF")
-                cell.fill=PatternFill("solid",fgColor="17365D")
-                cell.alignment=Alignment(vertical="center",wrap_text=True)
-            for col in ws.columns:
-                width=max((min(len(str(c.value or "")),42) for c in list(col)[:150]),default=12)
-                ws.column_dimensions[get_column_letter(col[0].column)].width=max(12,width+2)
-        final=io.BytesIO(); wb.save(final)
-        st.download_button("Download complete Excel report",final.getvalue(),"KSIM_Complete_Report.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",type="primary")
+        q=sb.table("projects").select("id,name,workspace_type,group_id,updated_at,payload")
+        if workspace_id:
+            q=q.eq("workspace_type","group").eq("group_id",workspace_id)
+        else:
+            q=q.eq("workspace_type","personal").eq("owner_id",uid)
+        return q.order("updated_at", desc=True).execute().data or []
     except Exception as exc:
-        st.warning(f"Excel export could not be prepared: {exc}")
+        st.warning(f"Could not load projects. Check schema.sql and Supabase RLS setup. Details: {exc}")
+        return []
 
-st.header("6 · Cross-impact influence and dependence")
-if result:
-    A=result["matrix"]
-    metrics=pd.DataFrame({"Code":A.index,"Entity":vars_run["Entity"].tolist(),"Relevant attribute":vars_run["Relevant attribute"].tolist(),"Influence (row sum)":A.sum(axis=1).values,"Dependence (column sum)":A.sum(axis=0).values})
-    st.dataframe(metrics,use_container_width=True,hide_index=True)
-    figm=px.scatter(metrics,x="Dependence (column sum)",y="Influence (row sum)",text="Code",hover_data=["Entity","Relevant attribute"],title="Influence vs dependence")
-    st.plotly_chart(figm,use_container_width=True)
+projects=load_projects()
+project_options={f"{p['name']} · updated {str(p.get('updated_at',''))[:10]}":p for p in projects}
+with st.sidebar:
+    st.divider()
+    st.markdown("### Saved projects")
+    selected_project_label=st.selectbox("Open a saved project", ["— New project —"]+list(project_options), key="project_picker")
+    project_to_load=project_options.get(selected_project_label)
+    if project_to_load and st.button("Load selected project", use_container_width=True):
+        st.session_state.project_payload=project_to_load.get("payload") or {}
+        st.session_state.project_id=project_to_load.get("id")
+        st.session_state.project_name=project_to_load.get("name", "Untitled project")
+        st.rerun()
+    if selected_project_label == "— New project —" and "project_payload" not in st.session_state:
+        st.session_state.project_payload={}
+        st.session_state.project_id=None
+        st.session_state.project_name="Untitled project"
 
-st.divider()
-st.caption("Privacy and persistence: saved project queries are restricted to the signed-in user ID, and passwords are stored as salted PBKDF2 hashes. This is an application-level login, not an enterprise identity provider. SQLite on ephemeral hosting may be reset; configure persistent storage or a managed database before using it as the sole copy of important work. Export JSON backups regularly.")
+payload=st.session_state.get("project_payload", {})
+project_name=st.text_input("Project name", value=st.session_state.get("project_name","Untitled project"), key="project_name_input")
+st.session_state.project_name=project_name
+st.caption(f"Workspace: {workspace_label} · AS-IS and TO-BE models are saved within this workspace.")
+
+# ---------------- Project configuration ----------------
+st.header("1. Define your problem and variables")
+problem = st.text_area("Problem statement", value=payload.get("problem", ""), placeholder="Describe the system or problem you want to study.")
+entity_text = st.text_area("Entities and their descriptions (one per line: Entity — description)", value=payload.get("entities_text", ""), placeholder="City residents — people affected by the issue\nGovernment — policy and enforcement actor\nParthenium — invasive weed")
+variables_text = st.text_area("Modelled variables / attributes (one per line)", value=payload.get("variables_text", ""), placeholder="Parthenium abundance\nPollen exposure\nAsthma incidence\nPublic awareness")
+var_names=[v.strip() for v in variables_text.splitlines() if v.strip()]
+if len(var_names)<2: st.info("Add at least two variables to configure the matrices and simulations.")
+if len(var_names)>20: st.error("For this interactive version, use at most 20 variables.")
+
+# Helpers for square matrices
+def matrix_editor(label, defaults, key):
+    st.subheader(label)
+    return st.data_editor(defaults, use_container_width=True, key=key, num_rows="fixed")
+
+def fresh_matrix(names, existing=None):
+    if existing:
+        df=pd.DataFrame(existing)
+        if list(df.index.astype(str)) == names and list(df.columns.astype(str)) == names: return df
+    return pd.DataFrame(np.zeros((len(names),len(names))), index=names, columns=names, dtype=float)
+
+if 2 <= len(var_names) <= 20:
+    st.caption("Matrix convention for KSIM: rows are target variables and columns are source variables. Positive values represent reinforcing influence; negative values represent inhibiting influence. Use values between -1 and +1.")
+    default_as_is=fresh_matrix(var_names, payload.get("asis_matrix"))
+    asis=matrix_editor("2. AS-IS cross-impact matrix", default_as_is, "asis_matrix_editor")
+    try:
+        asis=asis.apply(pd.to_numeric, errors="raise")
+        if asis.isna().any().any() or not np.isfinite(asis.to_numpy()).all(): raise ValueError("Fill every matrix cell with a finite number.")
+        if (asis.abs().to_numpy()>1).any(): raise ValueError("Each impact value must be between -1 and +1.")
+    except Exception as exc:
+        st.error(f"AS-IS matrix needs attention: {exc}")
+        st.stop()
+
+    st.subheader("3. Initial values and simulation settings")
+    default_settings=payload.get("settings")
+    if default_settings and [x.get("Variable") for x in default_settings] == var_names:
+        settings_df=pd.DataFrame(default_settings)
+    else:
+        settings_df=pd.DataFrame({"Variable":var_names,"Initial value":[0.5]*len(var_names),"Minimum":[0.0]*len(var_names),"Maximum":[1.0]*len(var_names)})
+    settings=st.data_editor(settings_df,use_container_width=True,hide_index=True,num_rows="fixed",key="settings_editor",disabled=["Variable"])
+    c1,c2=st.columns(2)
+    steps=int(c1.number_input("Simulation periods after T0",min_value=1,max_value=100,value=int(payload.get("steps",10)),step=1))
+    dt=float(c2.number_input("Time-step multiplier",min_value=0.1,max_value=5.0,value=float(payload.get("dt",1.0)),step=0.1))
+
+    st.header("4. TO-BE: Select and define interventions")
+    st.write("You can add new intervention variables or represent an intervention through changed relationships among existing variables. The portal will not invent causal impacts; you define their strengths below.")
+    default_interventions=payload.get("interventions", [{"Select":False,"Intervention":"Biological control beetle","Type":"New variable","Variable name":"Beetle abundance","Description":"Beetle reduces Parthenium abundance"}])
+    intervention_df=pd.DataFrame(default_interventions)
+    for col, default in [("Select",False),("Intervention","Intervention"),("Type","New variable"),("Variable name",""),("Description","")]:
+        if col not in intervention_df: intervention_df[col]=default
+    intervention_df=intervention_df[["Select","Intervention","Type","Variable name","Description"]]
+    interventions=st.data_editor(intervention_df,use_container_width=True,num_rows="dynamic",key="interventions_editor",column_config={"Select":st.column_config.CheckboxColumn("Apply simultaneously?"),"Type":st.column_config.SelectboxColumn("Intervention type",options=["New variable","Modify existing relationships"])} )
+    chosen=interventions[interventions["Select"].fillna(False).astype(bool)].copy()
+    st.caption(f"Selected interventions: {len(chosen)}. Select multiple rows to apply several interventions at once.")
+
+    # Build target variable list from baseline variables plus selected new-variable interventions.
+    tobe_names=list(var_names)
+    new_intervention_vars=[]
+    for _,row in chosen.iterrows():
+        if str(row.get("Type",""))=="New variable":
+            nm=str(row.get("Variable name","")).strip()
+            if nm and nm not in tobe_names:
+                tobe_names.append(nm); new_intervention_vars.append(nm)
+    if len(tobe_names)>20:
+        st.error("Selected interventions would create more than 20 variables. Reduce the number of variables or interventions.")
+        st.stop()
+    st.subheader("5. TO-BE cross-impact matrix")
+    auto_key="auto_matrix_"+"_".join(tobe_names)
+    # Start from AS-IS relationships; newly introduced variables receive zero relationships until specified.
+    tobe_default=fresh_matrix(tobe_names)
+    tobe_default.loc[var_names,var_names]=asis.to_numpy()
+    saved_tobe=payload.get("tobe_matrix")
+    if saved_tobe:
+        saved_df=pd.DataFrame(saved_tobe)
+        common_rows=[x for x in tobe_names if x in saved_df.index]
+        common_cols=[x for x in tobe_names if x in saved_df.columns]
+        if common_rows and common_cols: tobe_default.loc[common_rows,common_cols]=saved_df.loc[common_rows,common_cols]
+    # Explicit intervention relationship rules provide deterministic auto-generation.
+    st.markdown("**Automatic matrix generation rules**")
+    st.caption("For each selected intervention, enter a target variable, source variable, and impact strength. These rules are used to generate the TO-BE matrix. You can then manually edit any cell below.")
+    rules=[]
+    for idx,(_,row) in enumerate(chosen.iterrows()):
+        intervention_name=str(row.get("Intervention",f"Intervention {idx+1}"))
+        suggested_source=str(row.get("Variable name","")).strip() if str(row.get("Type",""))=="New variable" else (var_names[0] if var_names else "")
+        if suggested_source not in tobe_names: suggested_source=tobe_names[0]
+        st.markdown(f"**{intervention_name}**")
+        rc1,rc2,rc3=st.columns([2,2,1])
+        target=rc1.selectbox("Target variable",tobe_names,index=0,key=f"rule_target_{idx}")
+        source=rc2.selectbox("Source variable",tobe_names,index=tobe_names.index(suggested_source),key=f"rule_source_{idx}")
+        impact=float(rc3.number_input("Impact (-1 to +1)",min_value=-1.0,max_value=1.0,value=-0.5 if "reduce" in str(row.get("Description","")).lower() else -0.3,step=0.1,key=f"rule_impact_{idx}"))
+        rules.append({"intervention":intervention_name,"target":target,"source":source,"impact":impact})
+    if st.button("Generate TO-BE matrix from intervention rules", type="secondary"):
+        generated=tobe_default.copy()
+        for rule in rules:
+            generated.loc[rule["target"],rule["source"]]=rule["impact"]
+        st.session_state.generated_tobe_matrix=generated
+        st.session_state["tobe_matrix_editor"]=generated
+        st.success("Generated a TO-BE matrix from the relationships you specified. Review and edit it below.")
+    if "generated_tobe_matrix" in st.session_state and list(st.session_state.generated_tobe_matrix.index)==tobe_names:
+        tobe_base=st.session_state.generated_tobe_matrix.copy()
+    else: tobe_base=tobe_default.copy()
+    tobe=matrix_editor("Editable TO-BE matrix (manual edits are supported)", tobe_base, "tobe_matrix_editor")
+    try:
+        tobe=tobe.apply(pd.to_numeric,errors="raise")
+        if tobe.isna().any().any() or not np.isfinite(tobe.to_numpy()).all(): raise ValueError("Fill every matrix cell with a finite number.")
+        if (tobe.abs().to_numpy()>1).any(): raise ValueError("Each impact value must be between -1 and +1.")
+    except Exception as exc:
+        st.error(f"TO-BE matrix needs attention: {exc}")
+        st.stop()
+
+    # Intervention initial values are set separately; all original variables keep AS-IS initial values.
+    base_settings=settings.copy()
+    try:
+        init=pd.to_numeric(base_settings["Initial value"],errors="raise").to_numpy(float)
+        mins=pd.to_numeric(base_settings["Minimum"],errors="raise").to_numpy(float)
+        maxs=pd.to_numeric(base_settings["Maximum"],errors="raise").to_numpy(float)
+        if not np.isfinite(init).all() or not np.isfinite(mins).all() or not np.isfinite(maxs).all(): raise ValueError("Initial values and bounds must be finite.")
+        if (maxs<=mins).any() or ((init<mins)|(init>maxs)).any(): raise ValueError("Check that maximum > minimum and each initial value is within its bounds.")
+    except Exception as exc:
+        st.error(f"Initial values error: {exc}")
+        st.stop()
+    settings_map={r["Variable"]:r for r in settings.to_dict("records")}
+    for nm in new_intervention_vars:
+        st.markdown(f"**Initial value for new variable: {nm}**")
+        ic1,ic2,ic3=st.columns(3)
+        settings_map[nm]={"Variable":nm,"Initial value":float(ic1.number_input(f"{nm} initial value",value=0.2,key=f"init_{nm}")),"Minimum":float(ic2.number_input(f"{nm} minimum",value=0.0,key=f"min_{nm}")),"Maximum":float(ic3.number_input(f"{nm} maximum",value=1.0,key=f"max_{nm}"))}
+
+    if st.button("Run AS-IS and TO-BE simulations",type="primary",use_container_width=True):
+        try:
+            if not np.isfinite(tobe.to_numpy(float)).all(): raise ValueError("TO-BE matrix contains invalid values.")
+            # AS-IS baseline
+            asis_initial=(init-mins)/(maxs-mins)
+            asis_hist, asis_exp=run_ksim(asis_initial,asis.to_numpy(float),steps=steps,dt=dt)
+            asis_actual=denormalize_ksim(asis_hist,mins,maxs)
+            asis_result=pd.DataFrame(asis_actual,columns=var_names)
+            asis_result.insert(0,"Time",[f"T{i}" for i in range(len(asis_result))])
+            # TO-BE initial state: original values plus configured values for new intervention variables.
+            tobe_init=[]; tobe_min=[]; tobe_max=[]
+            for nm in tobe_names:
+                item=settings_map.get(nm,{"Initial value":0.2,"Minimum":0.0,"Maximum":1.0})
+                mn=float(item["Minimum"]); mx=float(item["Maximum"]); iv=float(item["Initial value"])
+                if mx<=mn or iv<mn or iv>mx: raise ValueError(f"Check initial value and bounds for {nm}.")
+                tobe_min.append(mn); tobe_max.append(mx); tobe_init.append((iv-mn)/(mx-mn))
+            tobe_hist,tobe_exp=run_ksim(np.asarray(tobe_init),tobe.to_numpy(float),steps=steps,dt=dt)
+            tobe_actual=denormalize_ksim(tobe_hist,tobe_min,tobe_max)
+            tobe_result=pd.DataFrame(tobe_actual,columns=tobe_names)
+            tobe_result.insert(0,"Time",[f"T{i}" for i in range(len(tobe_result))])
+            st.session_state.sim_results={"asis":asis_result,"tobe":tobe_result,"asis_exp":asis_exp,"tobe_exp":tobe_exp,"asis_matrix":asis.copy(),"tobe_matrix":tobe.copy(),"variables":var_names,"tobe_variables":tobe_names,"interventions":chosen.to_dict("records"),"rules":rules,"steps":steps,"dt":dt}
+            st.success("Both simulations completed.")
+        except Exception as exc: st.error(f"Simulation failed: {exc}")
+
+    result=st.session_state.get("sim_results")
+    if result:
+        st.header("6. AS-IS vs TO-BE results")
+        asis_result=result["asis"]; tobe_result=result["tobe"]
+        compare_vars=[v for v in result["variables"] if v in result["tobe_variables"]]
+        choice=st.multiselect("Variables to compare",compare_vars,default=compare_vars[:min(6,len(compare_vars))])
+        if choice:
+            chart_rows=[]
+            for v in choice:
+                for _,r in asis_result.iterrows(): chart_rows.append({"Time":r["Time"],"Variable":v,"Value":r[v],"Scenario":"AS-IS"})
+                for _,r in tobe_result.iterrows(): chart_rows.append({"Time":r["Time"],"Variable":v,"Value":r[v],"Scenario":"TO-BE"})
+            chart_df=pd.DataFrame(chart_rows)
+            st.plotly_chart(px.line(chart_df,x="Time",y="Value",color="Scenario",facet_col="Variable",facet_col_wrap=2,markers=True,title="Baseline vs intervention scenarios"),use_container_width=True)
+        c1,c2=st.columns(2)
+        with c1:
+            st.subheader("AS-IS results")
+            st.dataframe(asis_result,use_container_width=True,hide_index=True)
+            st.download_button("Download AS-IS CSV",asis_result.to_csv(index=False).encode(),"asis_results.csv","text/csv")
+        with c2:
+            st.subheader("TO-BE results")
+            st.dataframe(tobe_result,use_container_width=True,hide_index=True)
+            st.download_button("Download TO-BE CSV",tobe_result.to_csv(index=False).encode(),"tobe_results.csv","text/csv")
+        st.download_button("Download both scenarios (JSON)",json.dumps({"AS-IS":asis_result.to_dict("records"),"TO-BE":tobe_result.to_dict("records"),"selected_interventions":result["interventions"],"rules":result["rules"]},indent=2).encode(),"asis_tobe_comparison.json","application/json")
+
+    # Save current setup to Supabase. JSON payload stays in the row protected by RLS.
+    st.header("7. Save project")
+    current_payload={"problem":problem,"entities_text":entity_text,"variables_text":variables_text,"asis_matrix":asis.to_dict(),"tobe_matrix":tobe.to_dict(),"settings":settings.to_dict("records"),"steps":steps,"dt":dt,"interventions":interventions.to_dict("records")}
+    save_col, delete_col=st.columns([2,1])
+    if save_col.button("Save project to my workspace",type="primary",use_container_width=True):
+        row={"name":project_name.strip() or "Untitled project","workspace_type":"group" if workspace_id else "personal","group_id":workspace_id,"payload":current_payload,"updated_at":datetime.utcnow().isoformat()}
+        try:
+            existing_id=st.session_state.get("project_id")
+            if existing_id:
+                sb.table("projects").update(row).eq("id",existing_id).execute()
+            else:
+                row["owner_id"] = uid
+                response=sb.table("projects").insert(row).execute()
+                if response.data: st.session_state.project_id=response.data[0]["id"]
+            st.session_state.project_payload=current_payload
+            st.success("Project saved to the selected workspace.")
+            st.rerun()
+        except Exception as exc: st.error(f"Could not save project: {exc}")
+    if delete_col.button("Delete loaded project",use_container_width=True,disabled=not st.session_state.get("project_id")):
+        try:
+            sb.table("projects").delete().eq("id",st.session_state.project_id).execute()
+            st.session_state.project_id=None; st.session_state.project_payload={}
+            st.success("Project deleted."); st.rerun()
+        except Exception as exc: st.error(f"Could not delete project: {exc}")
+
+    st.header("8. Export matrices")
+    export_buffer=io.BytesIO()
+    with pd.ExcelWriter(export_buffer,engine="openpyxl") as writer:
+        asis.to_excel(writer,sheet_name="AS-IS Matrix")
+        tobe.to_excel(writer,sheet_name="TO-BE Matrix")
+        settings.to_excel(writer,sheet_name="Initial Values",index=False)
+        interventions.to_excel(writer,sheet_name="Interventions",index=False)
+        if result:
+            result["asis"].to_excel(writer,sheet_name="AS-IS Results",index=False)
+            result["tobe"].to_excel(writer,sheet_name="TO-BE Results",index=False)
+    st.download_button("Download full project workbook",export_buffer.getvalue(),"systems_thinking_project.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")

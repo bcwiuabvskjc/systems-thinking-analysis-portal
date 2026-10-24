@@ -1,0 +1,24 @@
+PROFESSOR WORKBOOK REFERENCE VALIDATION
+=======================================
+Reference workbook supplied by user: Kane_Simulation_Model_Final_Sample(1)(1).xlsx
+Sheets inspected: AS_IS_Parthenium, Sheet1, Intervention_1
+
+Automated checks implemented in analysis_core.py and tests/test_ksim.py:
+1. AS-IS T0->T1 numerator/denominator/exponent/next state for X1-X6.
+2. Intervention T0->T1 values for X1-X6 plus beetle state X7=0.
+3. Beetle abundance activation exactly at T4 = 0.3.
+4. Intervention T4->T5 values for X1-X7.
+5. A zero-impact matrix preserves current state (exponent=1).
+6. Excel template bytes are generated successfully.
+
+Observed test result during package build: ALL TESTS PASSED.
+
+Key reference values (AS-IS T0->T1):
+X1 numerator 1.030; denominator 1.150; exponent 0.8956521739130435; next 0.5375041601962823
+X2 numerator 1.240; denominator 1.350; exponent 0.9185185185185184; next 0.3812572013307588
+X3 numerator 1.490; denominator 1.170; exponent 1.2735042735042736; next 0.2626447390717447
+X4 numerator 1.235; denominator 1.755; exponent 0.7037037037037037; next 0.42859617449632537
+X5 numerator 1.135; denominator 1.455; exponent 0.7800687285223368; next 0.39094768158173915
+X6 numerator 1.175; denominator 1.865; exponent 0.6300268096514745; next 0.23440841070163995
+
+The automated checks cover the reference points listed above. They do not claim that all possible user-created models are empirically validated; users must define and justify intervention impacts.

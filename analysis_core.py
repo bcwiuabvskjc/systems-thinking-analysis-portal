@@ -1,216 +1,208 @@
-"""KSIM calculations aligned to the course formula shown in the supplied workbook."""
+"""Core analysis functions for the Systems Thinking Analysis Portal."""
 from __future__ import annotations
-import hashlib, hmac, json, os, secrets, sqlite3
-from pathlib import Path
-from typing import Any
+
+import io
 import numpy as np
 import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 
-DB_PATH = os.environ.get("KSIM_DB_PATH", str(Path(__file__).with_name("ksim_portal.sqlite3")))
-
-KSIM_FORMULA = (
-    "x_i(t+dt) = x_i(t) ** p_i(t);  "
-    "p_i(t) = [1 + (dt/2) * sum_j((|a_ij| - a_ij) * x_j(t))] / "
-    "[1 + (dt/2) * sum_j((|a_ij| + a_ij) * x_j(t))]. "
-    "Rows are target variables i; columns are source variables j. States are in [0, 1]."
+KSIM_METHOD = (
+    "Documented simplified KSIM-style variant. Variables are normalized to [0,1]. "
+    "For each target, positive and negative exposures are calculated from signed "
+    "interaction coefficients weighted by current source states. The exponent P "
+    "is (negative exposure + epsilon)/(positive exposure + epsilon), and the update "
+    "is x_next = x_current ** (P * dt). This is not guaranteed to match every "
+    "published KSIM formulation or a course-specific variant."
 )
 
 
-def validate_model(variables: pd.DataFrame, matrix: pd.DataFrame) -> None:
-    required = {"Code", "Entity", "Relevant attribute", "Initial value", "Start time"}
-    missing = required - set(variables.columns)
+def validate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    if df.empty:
+        rows.append({"Severity": "Error", "Check": "Empty dataset",
+                     "Details": "The CSV has no data rows."})
+    if len(df.columns) == 0:
+        rows.append({"Severity": "Error", "Check": "No columns",
+                     "Details": "No columns were detected."})
+    duplicates = df.columns[df.columns.duplicated()].tolist()
+    if duplicates:
+        rows.append({"Severity": "Error", "Check": "Duplicate column names",
+                     "Details": ", ".join(map(str, duplicates))})
+    missing = int(df.isna().sum().sum())
     if missing:
-        raise ValueError(f"Variable table is missing columns: {', '.join(sorted(missing))}")
-    if variables.empty:
-        raise ValueError("Add at least one variable before running the simulation.")
-    codes = variables["Code"].astype(str).str.strip().tolist()
-    if any(not c for c in codes) or len(set(codes)) != len(codes):
-        raise ValueError("Every variable needs a unique, non-empty code (for example X1, X2).")
-    if matrix.shape != (len(codes), len(codes)):
-        raise ValueError("The cross-impact matrix must be square and match the number of variables.")
-    if list(map(str, matrix.index)) != codes or list(map(str, matrix.columns)) != codes:
-        raise ValueError("Matrix row and column codes must match the variable codes in the same order.")
-    values = pd.to_numeric(variables["Initial value"], errors="coerce").to_numpy(float)
-    starts = pd.to_numeric(variables["Start time"], errors="coerce").to_numpy(float)
-    A = matrix.apply(pd.to_numeric, errors="coerce").to_numpy(float)
-    if not np.isfinite(values).all() or ((values < 0) | (values > 1)).any():
-        raise ValueError("Initial values must be numeric and between 0 and 1, as required by the supplied KSIM formulation.")
-    if not np.isfinite(starts).all() or (starts < 0).any() or (starts != np.floor(starts)).any():
-        raise ValueError("Start time must be a non-negative whole number.")
-    if not np.isfinite(A).all():
-        raise ValueError("Every cross-impact matrix cell must contain a finite number.")
+        rows.append({"Severity": "Warning", "Check": "Missing values",
+                     "Details": f"{missing} missing cells. Values were not imputed."})
+    if not rows:
+        rows.append({"Severity": "Pass", "Check": "Basic validation",
+                     "Details": "No basic structural issues detected."})
+    return pd.DataFrame(rows, columns=["Severity", "Check", "Details"])
 
 
-def run_ksim_course(variables: pd.DataFrame, matrix: pd.DataFrame, steps: int, dt: float = 1.0,
-                    interventions: pd.DataFrame | None = None):
-    """Run the course formula, supporting variables introduced at a later time.
+def coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    for col in result.columns:
+        if result[col].dtype == object:
+            values = result[col].astype(str).str.strip()
+            nonblank = values.ne("") & values.ne("nan")
+            parsed = pd.to_numeric(values.where(nonblank), errors="coerce")
+            if nonblank.sum() > 0 and parsed[nonblank].notna().all():
+                result[col] = parsed
+    return result
 
-    A variable with Start time=k is absent before k, starts at Initial value at k,
-    and participates in exponents from k onward. An intervention sets the selected
-    variable to a specified value at the beginning of the specified time point.
-    Returns state table, exponent table, and numeric arrays for downstream plotting.
+
+def detect_cross_impact(df, source_col=None, target_col=None, value_col=None):
+    if (source_col and target_col and value_col
+            and all(c in df.columns for c in [source_col, target_col, value_col])):
+        work = df[[source_col, target_col, value_col]].copy()
+        work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
+        if work.isna().any().any():
+            return None, "Mapped relationship rows contain missing or non-numeric values."
+        if work.duplicated([source_col, target_col]).any():
+            return None, "Duplicate source-target pairs found."
+        matrix = work.pivot(index=source_col, columns=target_col, values=value_col)
+        if (matrix.shape[0] != matrix.shape[1]
+                or set(matrix.index.astype(str)) != set(matrix.columns.astype(str))):
+            return None, "Long-form data must define a complete square set of source and target factors."
+        matrix.index = matrix.index.astype(str)
+        matrix.columns = matrix.columns.astype(str)
+        matrix = matrix.reindex(index=sorted(matrix.index), columns=sorted(matrix.columns))
+        return matrix, "Built from mapped relationship data."
+
+    if df.shape[1] >= 2:
+        labels = df.iloc[:, 0].astype(str)
+        factors = [str(c) for c in df.columns[1:]]
+        if len(factors) == len(labels) and set(labels) == set(factors):
+            values = df.iloc[:, 1:].copy()
+            values.columns = factors
+            values.index = labels
+            numeric = values.apply(pd.to_numeric, errors="coerce")
+            if not numeric.isna().any().any():
+                numeric = numeric.reindex(
+                    index=sorted(numeric.index), columns=sorted(numeric.columns)
+                )
+                return numeric, "Detected square matrix."
+    return None, "No unambiguous square matrix detected."
+
+
+def cross_impact_metrics(matrix):
+    numeric = matrix.apply(pd.to_numeric, errors="raise")
+    metrics = pd.DataFrame({
+        "Factor": numeric.index.astype(str),
+        "Influence (row sum)": numeric.sum(axis=1).to_numpy(),
+        "Dependence (column sum)": numeric.sum(axis=0).to_numpy(),
+    })
+    median_i = metrics["Influence (row sum)"].median()
+    median_d = metrics["Dependence (column sum)"].median()
+    metrics["Median-based descriptive group"] = metrics.apply(
+        lambda row: (
+            ("High" if row["Influence (row sum)"] >= median_i else "Low")
+            + " influence / "
+            + ("high" if row["Dependence (column sum)"] >= median_d else "low")
+            + " dependence"
+        ), axis=1
+    )
+    definitions = pd.DataFrame([
+        {"Metric": "Influence", "Definition": "Row sum",
+         "Interpretation": "Outgoing impact under the selected matrix convention."},
+        {"Metric": "Dependence", "Definition": "Column sum",
+         "Interpretation": "Incoming impact under the selected matrix convention."},
+    ])
+    return metrics, definitions
+
+
+def run_ksim(initial_values, interaction_matrix, steps=20, dt=1.0, epsilon=1e-9):
+    """Run a documented simplified KSIM-style simulation.
+
+    Initial values must be normalized to [0,1].
+    Matrix rows are target variables; columns are source variables.
+    Positive coefficients enhance a target; negative coefficients inhibit it.
     """
-    validate_model(variables, matrix)
-    if not isinstance(steps, int) or steps < 1 or steps > 200:
-        raise ValueError("Simulation periods must be between 1 and 200.")
-    if not np.isfinite(dt) or dt <= 0:
-        raise ValueError("Δt must be greater than zero.")
-    df = variables.reset_index(drop=True).copy()
-    codes = df["Code"].astype(str).tolist()
-    n = len(codes)
-    initials = pd.to_numeric(df["Initial value"]).to_numpy(float)
-    starts = pd.to_numeric(df["Start time"]).to_numpy(int)
-    A = matrix.to_numpy(float)
-    states = np.full((steps + 1, n), np.nan, dtype=float)
-    exps = np.full((steps + 1, n), np.nan, dtype=float)
-    nums = np.full((steps + 1, n), np.nan, dtype=float)
-    dens = np.full((steps + 1, n), np.nan, dtype=float)
-    active = np.zeros(n, dtype=bool)
+    x0 = np.asarray(initial_values, dtype=float)
+    matrix = np.asarray(interaction_matrix, dtype=float)
+    if x0.ndim != 1 or matrix.shape != (len(x0), len(x0)):
+        raise ValueError("Initial values must be a vector and the interaction matrix must be square with matching dimensions.")
+    if not np.isfinite(x0).all() or not np.isfinite(matrix).all():
+        raise ValueError("Inputs must contain only finite numeric values.")
+    if ((x0 < 0) | (x0 > 1)).any():
+        raise ValueError("Initial normalized values must be between 0 and 1.")
+    if not 1 <= steps <= 500:
+        raise ValueError("Choose between 1 and 500 simulation steps.")
+    if not 0 < dt <= 5:
+        raise ValueError("The time-step multiplier must be greater than 0 and at most 5.")
 
-    intervention_rows = []
-    if interventions is not None and not interventions.empty:
-        for _, r in interventions.iterrows():
-            code = str(r.get("Variable code", "")).strip()
-            time = int(r.get("Time", 0))
-            value = float(r.get("Set value", 0))
-            if code not in codes:
-                raise ValueError(f"Intervention refers to unknown variable code {code!r}.")
-            if not 0 <= time <= steps:
-                raise ValueError(f"Intervention time for {code} must be between T0 and T{steps}.")
-            if not 0 <= value <= 1:
-                raise ValueError("Intervention values must be between 0 and 1.")
-            intervention_rows.append((codes.index(code), time, value))
-
-    for t in range(steps + 1):
-        # Activate variables scheduled to enter at this time.
-        for i in range(n):
-            if starts[i] == t and not active[i]:
-                states[t, i] = initials[i]
-                active[i] = True
-        # Carry forward the prior state for already-active variables.
-        if t > 0:
-            for i in range(n):
-                if active[i] and np.isnan(states[t, i]) and not np.isnan(states[t-1, i]):
-                    states[t, i] = states[t-1, i]
-        # Apply interventions at the beginning of time t, before calculating P_i(t).
-        for i, itime, val in intervention_rows:
-            if itime == t:
-                if not active[i]:
-                    active[i] = True
-                    states[t, i] = val
-                else:
-                    states[t, i] = val
-        x = np.nan_to_num(states[t], nan=0.0)
-        for i in range(n):
-            if not active[i] or np.isnan(states[t, i]):
-                continue
-            # Formula from the provided course reference; inactive sources contribute zero.
-            numerator = 1.0 + (dt / 2.0) * np.sum((np.abs(A[i, :]) - A[i, :]) * x)
-            denominator = 1.0 + (dt / 2.0) * np.sum((np.abs(A[i, :]) + A[i, :]) * x)
-            if denominator == 0:
-                raise ValueError(f"Zero denominator for {codes[i]} at T{t}.")
-            p = numerator / denominator
-            nums[t, i], dens[t, i], exps[t, i] = numerator, denominator, p
-            if t < steps:
-                # Update after calculating the exponent at current time. Keep exact zero as zero.
-                states[t+1, i] = 0.0 if states[t, i] == 0 else float(states[t, i] ** p)
-    # Apply final scheduled activation if a variable starts at T=steps, then calculate its P.
-    # (Already handled in the loop above.)
-    return states, exps, nums, dens
+    x = np.clip(x0, epsilon, 1.0)
+    history = [x.copy()]
+    exponents = []
+    for _ in range(int(steps)):
+        next_x = x.copy()
+        current_exponents = []
+        for i in range(len(x)):
+            weighted = matrix[i, :] * x
+            positive = float(np.clip(weighted, 0, None).sum())
+            negative = float(np.clip(-weighted, 0, None).sum())
+            exponent = (negative + epsilon) / (positive + epsilon)
+            exponent = float(np.clip(exponent, 0.05, 20.0))
+            current_exponents.append(exponent)
+            next_x[i] = np.clip(x[i] ** (exponent * dt), epsilon, 1.0)
+        x = next_x
+        history.append(x.copy())
+        exponents.append(current_exponents)
+    return np.asarray(history), np.asarray(exponents)
 
 
-def make_state_frame(variables: pd.DataFrame, states: np.ndarray) -> pd.DataFrame:
-    base = variables[["Entity", "Relevant attribute", "Code"]].copy().reset_index(drop=True)
-    for t in range(states.shape[0]):
-        base[f"T{t}"] = states[t, :]
-    return base
+def denormalize_ksim(normalized, minimums, maximums):
+    minimums = np.asarray(minimums, dtype=float)
+    maximums = np.asarray(maximums, dtype=float)
+    if (maximums <= minimums).any():
+        raise ValueError("Each maximum must be greater than its minimum.")
+    return minimums + np.asarray(normalized) * (maximums - minimums)
 
 
-def make_calculation_frame(variables: pd.DataFrame, nums: np.ndarray, dens: np.ndarray, exps: np.ndarray) -> pd.DataFrame:
-    base = variables[["Entity", "Relevant attribute", "Code"]].copy().reset_index(drop=True)
-    for t in range(exps.shape[0]):
-        base[f"T{t} · Pᵢ Num"] = nums[t, :]
-        base[f"T{t} · Pᵢ Den"] = dens[t, :]
-        base[f"T{t} · Pᵢ"] = exps[t, :]
-    return base
+def build_excel(original, filename, cleaned, validation, params, matrix, metrics,
+                numeric_summary, notes, ksim_results=None, ksim_exponents=None):
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        original.to_excel(writer, sheet_name="Original Data", index=False)
+        cleaned.to_excel(writer, sheet_name="Cleaned Data", index=False)
+        validation.to_excel(writer, sheet_name="Data Validation", index=False)
+        params.to_excel(writer, sheet_name="Parameters and Assumptions", index=False)
+        if matrix is not None:
+            matrix.rename_axis("Factor").to_excel(writer, sheet_name="Cross-Impact Matrix")
+        if metrics is not None:
+            metrics.to_excel(writer, sheet_name="Influence Dependence", index=False)
+        if numeric_summary is not None and not numeric_summary.empty:
+            numeric_summary.to_excel(writer, sheet_name="Numeric Summary", index=False)
+        if ksim_results is not None:
+            ksim_results.to_excel(writer, sheet_name="KSIM Results", index=False)
+        if ksim_exponents is not None:
+            ksim_exponents.to_excel(writer, sheet_name="KSIM Exponents", index=False)
+        pd.DataFrame({"Notes and Interpretation": notes}).to_excel(
+            writer, sheet_name="Executive Summary", index=False
+        )
 
+    buffer.seek(0)
+    workbook = load_workbook(buffer)
+    for sheet in workbook.worksheets:
+        sheet.freeze_panes = "A2"
+        if sheet.max_row > 1:
+            sheet.auto_filter.ref = sheet.dimensions
+        for cell in sheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="17365D")
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+        for column_cells in sheet.columns:
+            width = max(
+                (min(len(str(cell.value or "")), 60)
+                 for cell in list(column_cells)[:250]),
+                default=10,
+            )
+            sheet.column_dimensions[
+                get_column_letter(column_cells[0].column)
+            ].width = max(12, min(width + 2, 42))
+        sheet.sheet_view.showGridLines = False
 
-def password_hash(password: str, salt: bytes | None = None) -> tuple[bytes, bytes]:
-    if len(password) < 10:
-        raise ValueError("Use a password with at least 10 characters.")
-    salt = salt or secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
-    return salt, digest
-
-
-def verify_password(password: str, salt: bytes, expected: bytes) -> bool:
-    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
-    return hmac.compare_digest(actual, expected)
-
-
-def db_connect():
-    con = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def init_db():
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    with db_connect() as con:
-        con.execute("PRAGMA journal_mode=WAL")
-        con.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, salt BLOB NOT NULL, password_hash BLOB NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
-        con.execute("CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, name TEXT NOT NULL, payload TEXT NOT NULL, updated_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,name), FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)")
-        con.commit()
-
-
-def register_user(username: str, password: str) -> None:
-    username = username.strip().lower()
-    if len(username) < 3 or len(username) > 40 or not username.replace("_", "").replace("-", "").isalnum():
-        raise ValueError("Username must be 3–40 characters and use letters, numbers, _ or - only.")
-    salt, digest = password_hash(password)
-    try:
-        with db_connect() as con:
-            con.execute("INSERT INTO users(username,salt,password_hash) VALUES(?,?,?)", (username, salt, digest))
-            con.commit()
-    except sqlite3.IntegrityError:
-        raise ValueError("That username already exists. Choose another username or sign in.")
-
-
-def authenticate_user(username: str, password: str):
-    with db_connect() as con:
-        row = con.execute("SELECT id, username, salt, password_hash FROM users WHERE username=?", (username.strip().lower(),)).fetchone()
-    if row and verify_password(password, row["salt"], row["password_hash"]):
-        return {"id": row["id"], "username": row["username"]}
-    return None
-
-
-def save_project(user_id: int, name: str, payload: dict[str, Any]) -> None:
-    name = name.strip()
-    if not name or len(name) > 100:
-        raise ValueError("Project name must be between 1 and 100 characters.")
-    encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False)
-    with db_connect() as con:
-        con.execute("INSERT INTO projects(user_id,name,payload,updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(user_id,name) DO UPDATE SET payload=excluded.payload, updated_at=CURRENT_TIMESTAMP", (user_id, name, encoded))
-        con.commit()
-
-
-def list_projects(user_id: int):
-    with db_connect() as con:
-        rows = con.execute("SELECT id,name,updated_at FROM projects WHERE user_id=? ORDER BY updated_at DESC, name", (user_id,)).fetchall()
-    return [dict(r) for r in rows]
-
-
-def load_project(user_id: int, project_id: int):
-    with db_connect() as con:
-        row = con.execute("SELECT name,payload,updated_at FROM projects WHERE id=? AND user_id=?", (project_id, user_id)).fetchone()
-    if not row:
-        raise ValueError("Project not found or you do not have permission to access it.")
-    return row["name"], json.loads(row["payload"]), row["updated_at"]
-
-
-def delete_project(user_id: int, project_id: int):
-    with db_connect() as con:
-        cur = con.execute("DELETE FROM projects WHERE id=? AND user_id=?", (project_id, user_id))
-        con.commit()
-    if cur.rowcount == 0:
-        raise ValueError("Project not found or you do not have permission to delete it.")
+    output = io.BytesIO()
+    workbook.save(output)
+    return output.getvalue()

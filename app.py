@@ -34,15 +34,29 @@ if sb is None:
     st.markdown("Open `README.txt` in the ZIP and complete the Supabase setup, then add `SUPABASE_URL` and `SUPABASE_ANON_KEY` to Streamlit Secrets.")
     st.stop()
 
-# Streamlit reruns create a new Supabase client, so restore the authenticated session.
-if st.session_state.auth_session and not st.session_state.user:
+# Streamlit reruns create a new Supabase client. Restore the authenticated
+# session on EVERY rerun before any table queries are made. Checking only
+# `not st.session_state.user` is insufficient because `user` remains populated
+# after login while `sb` is a newly created, unauthenticated client.
+if st.session_state.auth_session:
     try:
-        sess = st.session_state.auth_session
-        sb.auth.set_session(sess.access_token, sess.refresh_token)
+        saved_session = st.session_state.auth_session
+        sb.auth.set_session(
+            saved_session.access_token,
+            saved_session.refresh_token,
+        )
+        # Keep the latest session in case Supabase refreshed its tokens.
+        current_session = sb.auth.get_session()
+        if current_session is not None:
+            st.session_state.auth_session = current_session
         st.session_state.user = sb.auth.get_user().user
-    except Exception:
+    except Exception as exc:
         st.session_state.user = None
         st.session_state.auth_session = None
+        st.warning(
+            "Your login session could not be restored. Please log in again. "
+            f"Details: {exc}"
+        )
 
 if not st.session_state.user:
     st.subheader("Sign in or create a student account")
